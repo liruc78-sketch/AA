@@ -607,8 +607,9 @@
 
             const search = document.getElementById('admin-search').value.trim();
 
+            // 移除 assigned_config，列表页不需要展示它，需要时再单独查
             let query = sbClient.from('users')
-                .select('id, username, hwid, is_approved, role, remark, request_mode, expiry_date, assigned_config, auto_webshare')
+                .select('id, username, hwid, is_approved, role, remark, request_mode, expiry_date, auto_webshare')
                 .order('id');
             if (search) query = query.or(`username.ilike.%${search}%,remark.ilike.%${search}%`);
 
@@ -680,23 +681,6 @@
         window.loadAdminData = loadAdminData;
         if (currentUser && currentUser.role === 'super') refreshSubAdminSelect();
         
-        // 刷新次级管理下拉框
-        async function refreshSubAdminSelect() {
-            const { data } = await sbClient.from('users')
-                .select('id, username')
-                .eq('is_admin', true)
-                .neq('role', 'super');
-            const sel = document.getElementById('subperm-admin-select');
-            if (!sel) return;
-            sel.innerHTML = '<option value="">-- 选择次级管理员 --</option>';
-            (data || []).forEach(u => {
-                const opt = document.createElement('option');
-                opt.value = u.id;
-                opt.textContent = u.username;
-                sel.appendChild(opt);
-            });
-        }
-        window.refreshSubAdminSelect = refreshSubAdminSelect;
         
         // 刷新次级管理下拉框
         async function refreshSubAdminSelect() {
@@ -732,10 +716,18 @@
         }
 
         async function toggleUserStatus(uid, currentStatus, targetRole) {
-            if (!checkPermission(targetRole)) return showCustomAlert("权限不足：无法操作超级管理员！");
-            if (!await showCustomConfirm(`确定要${currentStatus ? '封禁' : '批准'}该用户吗？`)) return;
-            await sbClient.from('users').update({ is_approved: !currentStatus }).eq('id', uid);
-            loadAdminData();
+    if (!checkPermission(targetRole)) return showCustomAlert("权限不足：无法操作超级管理员！");
+    if (!await showCustomConfirm(`确定要${currentStatus ? '封禁' : '批准'}该用户吗？`)) return;
+    await sbClient.from('users').update({ is_approved: !currentStatus }).eq('id', uid);
+    // 只更新这一行的 DOM，不重新拉全表
+    const row = document.querySelector(`.toggle-status-btn[data-uid="${uid}"]`).closest('tr');
+    const badge = row.querySelector('.status-badge');
+    const btn = row.querySelector('.toggle-status-btn');
+    const newStatus = !currentStatus;
+    badge.className = `status-badge ${newStatus ? 'status-ok' : 'status-ban'}`;
+    badge.textContent = newStatus ? '正常' : '封禁/待审';
+    btn.textContent = newStatus ? '封禁' : '批准';
+    btn.dataset.status = String(newStatus);
             // 新用户被批准时，提示超级管理是否授权给次级管理查看
             if (!currentStatus && currentUser.role === 'super') {
                 // 获取用户名
@@ -800,13 +792,12 @@
             }
 
             try {
-                const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', uid).single();
-                let currentConfig = userData.assigned_config || {};
-                currentConfig[mode] = configData;
-                const { error } = await sbClient.from('users').update({ 
-                    assigned_config: currentConfig,
-                    request_mode: null 
-                }).eq('id', uid);
+                // 直接用 jsonb || 合并写入，无需先 SELECT
+                const { error } = await sbClient.rpc('merge_assigned_config', {
+                    p_uid: uid,
+                    p_mode: mode,
+                    p_data: configData
+                });
                 if (error) throw error;
                 showCustomAlert(`✅ 已成功分配给 [${username}]！\n用户点击同步即可生效。`);
                 loadAdminData(); 
