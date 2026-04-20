@@ -729,7 +729,34 @@
                     request_mode: null 
                 }).eq('id', uid);
                 if (error) throw error;
-                showCustomAlert(`✅ 已成功分配给 [${username}]！\n用户点击同步即可生效。`);
+
+                // ✅ 【优化】写入完成后，通过 Broadcast 主动推送一条消息给用户端
+                // 用户端的 Broadcast 频道收到消息后立即断开，整个流程总共只消耗 2 条 Realtime 消息
+                try {
+                    const deliveryChannel = sbClient.channel('config-delivery-' + uid, {
+                        config: { broadcast: { ack: false } }
+                    });
+                    // 等频道就绪后发送，发完立即销毁
+                    await new Promise((resolve) => {
+                        deliveryChannel.subscribe((status) => {
+                            if (status === 'SUBSCRIBED') {
+                                deliveryChannel.send({
+                                    type: 'broadcast',
+                                    event: 'config_push',
+                                    payload: { mode, config: configData }
+                                }).then(() => {
+                                    sbClient.removeChannel(deliveryChannel);
+                                    resolve();
+                                });
+                            }
+                        });
+                    });
+                } catch (broadcastErr) {
+                    // Broadcast 失败不影响主流程，配置已写入数据库
+                    console.warn('[Admin] Broadcast 推送失败（配置已写入，用户可手动刷新）:', broadcastErr);
+                }
+
+                showCustomAlert(`✅ 已成功分配给 [${username}]！配置已实时推送给用户。`);
                 loadAdminData(); 
             } catch (e) {
                 showCustomAlert("分配失败: " + e.message);
@@ -1003,9 +1030,15 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         function initAdminRealtimeListener() {
             if (!currentUser || currentUser.role !== 'super') return;
             console.log("[System] 管理员监听服务已启动...");
-            sbClient.channel('admin-global-alerts').on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'users', filter: 'request_mode=neq.null' }, (payload) => {
-                const newData = payload.new;
-                if (newData.request_mode) {
+
+            // ✅ 【优化】将原来两条独立频道（admin-global-alerts + admin-new-user-alerts）
+            // 合并为一条频道上的两个事件监听，只占用 1 条 Realtime 连接，节省约 50% 频道开销。
+            sbClient.channel('admin-global-alerts')
+                // — 事件一：监听用户请求刷新服务器（UPDATE 且 request_mode 有值）
+                .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'users', filter: 'request_mode=neq.null' }, (payload) => {
+                    const newData = payload.new;
+                    if (!newData.request_mode) return;
+
                     const uniqueKey = `${newData.id}_${newData.request_mode}`;
                     if (notifiedCache.has(uniqueKey)) return;
                     notifiedCache.add(uniqueKey);
@@ -1013,37 +1046,57 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
                     // 智能通知系统：判断环境
                     const title = '本德后台通知';
                     const body = `用户 [${newData.username}] 请求刷新服务器，请及时处理！`;
-
-                    // 1. 如果在 Electron 软件环境中
                     if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
                         window.electronAPI.showSysNotification(title, body);
-                    } 
-                    // 2. 如果在普通浏览器环境中
-                    else if ('Notification' in window) {
+                    } else if ('Notification' in window) {
                         if (Notification.permission === 'granted') {
                             new Notification(title, { body: body });
                         } else if (Notification.permission !== 'denied') {
                             Notification.requestPermission().then(permission => {
-                                if (permission === 'granted') {
-                                    new Notification(title, { body: body });
-                                }
+                                if (permission === 'granted') new Notification(title, { body: body });
                             });
                         }
                     }
+
                     // 自动分配服务器三
                     if (newData.request_mode === 'webshare' && newData.auto_webshare) {
                         (async () => { try {
                             const { data: cfgData } = await sbClient.from('app_config').select('webshare_global_url').eq('id', 1).single();
                             const globalUrl = cfgData && cfgData.webshare_global_url;
                             if (globalUrl) {
+                                const configData = { url: globalUrl, updated_at: new Date().toISOString() };
                                 const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', newData.id).single();
                                 let currentConfig = userData.assigned_config || {};
-                                currentConfig['webshare'] = { url: globalUrl, updated_at: new Date().toISOString() };
+                                currentConfig['webshare'] = configData;
                                 await sbClient.from('users').update({
                                     assigned_config: currentConfig,
                                     request_mode: null
                                 }).eq('id', newData.id);
                                 console.log(`[Auto] 已自动分配服务器三给用户 [${newData.username}]`);
+
+                                // 自动分配完成后，通过 Broadcast 实时推送给用户端
+                                try {
+                                    const autoDeliveryChannel = sbClient.channel('config-delivery-' + newData.id, {
+                                        config: { broadcast: { ack: false } }
+                                    });
+                                    await new Promise((resolve) => {
+                                        autoDeliveryChannel.subscribe((status) => {
+                                            if (status === 'SUBSCRIBED') {
+                                                autoDeliveryChannel.send({
+                                                    type: 'broadcast',
+                                                    event: 'config_push',
+                                                    payload: { mode: 'webshare', config: configData }
+                                                }).then(() => {
+                                                    sbClient.removeChannel(autoDeliveryChannel);
+                                                    resolve();
+                                                });
+                                            }
+                                        });
+                                    });
+                                    console.log(`[Auto] Broadcast 推送成功 → 用户 [${newData.username}]`);
+                                } catch(broadcastErr) {
+                                    console.warn('[Auto] Broadcast 推送失败（配置已写入）:', broadcastErr);
+                                }
                             }
                         } catch(e) {
                             console.error('[Auto] 自动分配失败:', e);
@@ -1051,28 +1104,26 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
                     }
 
                     if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
-                }
-            }).subscribe((status) => console.log("📡 管理员通道订阅状态:", status));
-
-            sbClient.channel('admin-new-user-alerts').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'users' }, (payload) => {
-                const newData = payload.new;
-                const title = '本德后台通知';
-                const body = `新用户 [${newData.username}] 已注册，请及时审核！`;
-                if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
-                    window.electronAPI.showSysNotification(title, body);
-                } else if ('Notification' in window) {
-                    if (Notification.permission === 'granted') {
-                        new Notification(title, { body: body });
-                    } else if (Notification.permission !== 'denied') {
-                        Notification.requestPermission().then(permission => {
-                            if (permission === 'granted') new Notification(title, { body: body });
-                        });
+                })
+                // — 事件二：监听新用户注册（INSERT），与事件一共享同一条 WebSocket 连接
+                .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'users' }, (payload) => {
+                    const newData = payload.new;
+                    const title = '本德后台通知';
+                    const body = `新用户 [${newData.username}] 已注册，请及时审核！`;
+                    if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
+                        window.electronAPI.showSysNotification(title, body);
+                    } else if ('Notification' in window) {
+                        if (Notification.permission === 'granted') {
+                            new Notification(title, { body: body });
+                        } else if (Notification.permission !== 'denied') {
+                            Notification.requestPermission().then(permission => {
+                                if (permission === 'granted') new Notification(title, { body: body });
+                            });
+                        }
                     }
-                }
-
-                
-                if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
-            }).subscribe((status) => console.log("📡 新用户通道订阅状态:", status));
+                    if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
+                })
+                .subscribe((status) => console.log("📡 管理员监听通道状态:", status));
         }
     </script>
 </body>
