@@ -1073,81 +1073,75 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         }
         function closeImagePreview() { document.getElementById('image-preview-overlay').style.display = 'none'; }
 
-        // ================= 🚀 实时监听 =================
         function initAdminRealtimeListener() {
-            if (!currentUser || currentUser.role !== 'super') return;
-            console.log("[System] 管理员监听服务已启动...");
-            sbClient.channel('admin-global-alerts').on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'users', filter: 'request_mode=neq.null' }, (payload) => {
-                const newData = payload.new;
-                if (newData.request_mode) {
-                    const uniqueKey = `${newData.id}_${newData.request_mode}`;
-                    if (notifiedCache.has(uniqueKey)) return;
-                    notifiedCache.add(uniqueKey);
+    if (!currentUser || currentUser.role !== 'super') return;
+    console.log("[System] 管理员监听服务已启动...");
+    sbClient.channel('admin-global-alerts')
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'users', filter: 'request_mode=neq.null' }, (payload) => {
+        const newData = payload.new;
+        if (!newData.request_mode) return;
 
-                    // 智能通知系统：判断环境
-                    const title = '本德后台通知';
-                    const body = `用户 [${newData.username}] 请求刷新服务器，请及时处理！`;
+        const uniqueKey = `${newData.id}_${newData.request_mode}`;
+        if (notifiedCache.has(uniqueKey)) return;
+        notifiedCache.add(uniqueKey);
 
-                    // 1. 如果在 Electron 软件环境中
-                    if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
-                        window.electronAPI.showSysNotification(title, body);
-                    } 
-                    // 2. 如果在普通浏览器环境中
-                    else if ('Notification' in window) {
-                        if (Notification.permission === 'granted') {
-                            new Notification(title, { body: body });
-                        } else if (Notification.permission !== 'denied') {
-                            Notification.requestPermission().then(permission => {
-                                if (permission === 'granted') {
-                                    new Notification(title, { body: body });
-                                }
-                            });
-                        }
-                    }
-                    // 自动分配服务器三
-                    if (newData.request_mode === 'webshare' && newData.auto_webshare) {
-                        (async () => { try {
-                            const { data: cfgData } = await sbClient.from('app_config').select('webshare_global_url').eq('id', 1).single();
-                            const globalUrl = cfgData && cfgData.webshare_global_url;
-                            if (globalUrl) {
-                                const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', newData.id).single();
-                                let currentConfig = userData.assigned_config || {};
-                                currentConfig['webshare'] = { url: globalUrl, updated_at: new Date().toISOString() };
-                                await sbClient.from('users').update({
-                                    assigned_config: currentConfig,
-                                    request_mode: null
-                                }).eq('id', newData.id);
-                                console.log(`[Auto] 已自动分配服务器三给用户 [${newData.username}]`);
-                            }
-                        } catch(e) {
-                            console.error('[Auto] 自动分配失败:', e);
-                        } })();
-                    }
+        const title = '本德后台通知';
+        const body = `用户 [${newData.username}] 请求刷新服务器，请及时处理！`;
 
-                    if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
-                }
-            }).subscribe((status) => console.log("📡 管理员通道订阅状态:", status));
-
-            sbClient.channel('admin-new-user-alerts').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'users' }, (payload) => {
-                const newData = payload.new;
-                const title = '本德后台通知';
-                const body = `新用户 [${newData.username}] 已注册，请及时审核！`;
-                if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
-                    window.electronAPI.showSysNotification(title, body);
-                } else if ('Notification' in window) {
-                    if (Notification.permission === 'granted') {
+        if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
+            window.electronAPI.showSysNotification(title, body);
+        } else if ('Notification' in window) {
+            if (Notification.permission === 'granted') {
+                new Notification(title, { body: body });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission().then(permission => {
+                    if (permission === 'granted') {
                         new Notification(title, { body: body });
-                    } else if (Notification.permission !== 'denied') {
-                        Notification.requestPermission().then(permission => {
-                            if (permission === 'granted') new Notification(title, { body: body });
-                        });
                     }
-                }
-
-                
-                if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
-            }).subscribe((status) => console.log("📡 新用户通道订阅状态:", status));
+                });
+            }
         }
+        if (newData.request_mode === 'webshare' && newData.auto_webshare) {
+            (async () => { try {
+                const { data: cfgData } = await sbClient.from('app_config').select('webshare_global_url').eq('id', 1).single();
+                const globalUrl = cfgData && cfgData.webshare_global_url;
+                if (globalUrl) {
+                    const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', newData.id).single();
+                    let currentConfig = userData.assigned_config || {};
+                    currentConfig['webshare'] = { url: globalUrl, updated_at: new Date().toISOString() };
+                    await sbClient.from('users').update({
+                        assigned_config: currentConfig,
+                        request_mode: null
+                    }).eq('id', newData.id);
+                    console.log(`[Auto] 已自动分配服务器三给用户 [${newData.username}]`);
+                }
+            } catch(e) {
+                console.error('[Auto] 自动分配失败:', e);
+            } })();
+        }
+
+        if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
+    })
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'users' }, (payload) => {
+        const newData = payload.new;
+        const title = '本德后台通知';
+        const body = `新用户 [${newData.username}] 已注册，请及时审核！`;
+        if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
+            window.electronAPI.showSysNotification(title, body);
+        } else if ('Notification' in window) {
+            if (Notification.permission === 'granted') {
+                new Notification(title, { body: body });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission().then(permission => {
+                    if (permission === 'granted') new Notification(title, { body: body });
+                });
+            }
+        }
+
+        if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
+    })
+    .subscribe((status) => console.log("📡 管理员通道订阅状态:", status));
+}
 
         // ============================================================
         // 💰 续费功能核心逻辑
