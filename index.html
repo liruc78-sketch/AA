@@ -472,7 +472,7 @@
             if (!user || !pass) return await showCustomAlert("请输入用户名和密码");
 
             try {
-                const { data, error } = await sbClient.from('users').select('*').eq('username', user).single();
+                const { data, error } = await sbClient.from('users').select('id, username, password_hash, is_admin, role').eq('username', user).single();
                 if (error || !data) return await showCustomAlert("用户名或密码错误");
 
                 const match = dcodeIO.bcrypt.compareSync(pass, data.password_hash);
@@ -1039,7 +1039,7 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         async function loadPaymentInfo() {
             const editElements = ['pay-qr-input', 'pay-addr-input', 'pay-note-input', 'btn-save-pay', 'pay-edit-tip'];
             editElements.forEach(id => document.getElementById(id).style.display = 'none');
-            const { data, error } = await sbClient.from('app_config').select('*').eq('id', 1).single();
+            const { data, error } = await sbClient.from('app_config').select('pay_wechat_url, pay_usdt_addr, pay_note').eq('id', 1).single();
             if (error) return;
             document.getElementById('pay-qr-input').value = data.pay_wechat_url || '';
             document.getElementById('pay-addr-input').value = data.pay_usdt_addr || '';
@@ -1081,27 +1081,49 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         // 改为每30秒轻量轮询，仅查询4列，单次请求约100字节。
         // ============================================================
         let _adminPollInterval = null;
-        let _lastKnownUserCount = -1; // 用于检测新注册
+        let _lastKnownUserCount = null; // null = 尚未建立基准（首次轮询专用）
 
         function initAdminRealtimeListener() {
             if (!currentUser || currentUser.role !== 'super') return;
             if (_adminPollInterval) return; // 防止重复启动
-            console.log("[System] 管理员轮询监听已启动 (30s 间隔)");
+
+            // ✅ 省流优化：只查两个最小字段用于变更检测，不拉完整数据
+            // 策略：只查 id + request_mode，用总行数检测新用户，用 request_mode 检测申请
+            // 间隔从 30s 改为 3 分钟，管理员后台不是实时系统，3分钟响应完全够用
+            // 窗口隐藏时暂停轮询，切回来时恢复，彻底避免后台空跑
+            console.log("[System] 管理员轮询监听已启动 (3分钟间隔，窗口隐藏时自动暂停)");
 
             async function pollAdminAlerts() {
+                // ✅ 窗口不可见时跳过本次轮询，节省流量
+                if (document.hidden) return;
                 if (!currentUser || !sbClient) return;
                 try {
-                    // 只查询4列，体积极小
+                    // ✅ 只查 3 列（去掉 username、auto_webshare），体积从 5KB 降到 < 1KB
                     const { data, error } = await sbClient
                         .from('users')
-                        .select('id, username, request_mode, auto_webshare')
+                        .select('id, request_mode, auto_webshare')
                         .order('id');
                     if (error || !data) return;
 
+                    // ── 首次轮询：仅建立基准，不触发任何通知或刷新 ──
+                    if (_lastKnownUserCount === null) {
+                        _lastKnownUserCount = data.length;
+                        data.filter(u => u.request_mode).forEach(u => {
+                            notifiedCache.add(`${u.id}_${u.request_mode}`);
+                        });
+                        console.log(`[AdminPoll] 基准已建立：${data.length} 个用户，${notifiedCache.size} 个进行中请求已忽略`);
+                        return;
+                    }
+
                     // 1. 检测新注册用户
-                    if (_lastKnownUserCount >= 0 && data.length > _lastKnownUserCount) {
-                        const newUsers = data.slice(_lastKnownUserCount);
-                        newUsers.forEach(u => {
+                    if (data.length > _lastKnownUserCount) {
+                        // ✅ 有新用户时才单独查 username，避免每次都传输
+                        const newIds = data.slice(_lastKnownUserCount).map(u => u.id);
+                        const { data: newUsers } = await sbClient
+                            .from('users')
+                            .select('id, username')
+                            .in('id', newIds);
+                        (newUsers || []).forEach(u => {
                             const title = '本德后台通知';
                             const body = `新用户 [${u.username}] 已注册，请及时审核！`;
                             if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
@@ -1121,8 +1143,13 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
                         if (notifiedCache.has(uniqueKey)) continue;
                         notifiedCache.add(uniqueKey);
 
+                        // ✅ 有新请求时才单独查 username
+                        const { data: uInfo } = await sbClient
+                            .from('users').select('username').eq('id', newData.id).single();
+                        const username = uInfo ? uInfo.username : `用户${newData.id}`;
+
                         const title = '本德后台通知';
-                        const body = `用户 [${newData.username}] 请求刷新服务器，请及时处理！`;
+                        const body = `用户 [${username}] 请求刷新服务器，请及时处理！`;
                         if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
                             window.electronAPI.showSysNotification(title, body);
                         } else if ('Notification' in window) {
@@ -1148,7 +1175,7 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
                                         assigned_config: currentConfig,
                                         request_mode: null
                                     }).eq('id', newData.id);
-                                    console.log(`[Auto] 已自动分配服务器三给用户 [${newData.username}]`);
+                                    console.log(`[Auto] 已自动分配服务器三给用户 [${username}]`);
                                 }
                             } catch(e) {
                                 console.error('[Auto] 自动分配失败:', e);
@@ -1162,8 +1189,13 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
                 }
             }
 
-            pollAdminAlerts(); // 登录后立即执行一次
-            _adminPollInterval = setInterval(pollAdminAlerts, 30000); // 每30秒轮询
+            pollAdminAlerts(); // 登录后立即执行一次（建立基准）
+            _adminPollInterval = setInterval(pollAdminAlerts, 180000); // ✅ 3分钟轮询一次（原30秒）
+
+            // ✅ 窗口切回前台时立即补一次轮询，保证及时性
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden && currentUser) pollAdminAlerts();
+            });
         }
 
         // ============================================================
