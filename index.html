@@ -472,7 +472,7 @@
             if (!user || !pass) return await showCustomAlert("请输入用户名和密码");
 
             try {
-                const { data, error } = await sbClient.from('users').select('id, username, password_hash, is_admin, role').eq('username', user).single();
+                const { data, error } = await sbClient.from('users').select('*').eq('username', user).single();
                 if (error || !data) return await showCustomAlert("用户名或密码错误");
 
                 const match = dcodeIO.bcrypt.compareSync(pass, data.password_hash);
@@ -496,12 +496,6 @@
         }
 
         function logout() {
-            // 停止管理员轮询
-            if (_adminPollInterval) {
-                clearInterval(_adminPollInterval);
-                _adminPollInterval = null;
-            }
-            _lastKnownUserCount = -1;
             localStorage.removeItem('adminUser');
             alert("已退出登录。");
             window.close();
@@ -613,9 +607,8 @@
 
             const search = document.getElementById('admin-search').value.trim();
 
-            // 移除 assigned_config，列表页不需要展示它，需要时再单独查
             let query = sbClient.from('users')
-                .select('id, username, hwid, is_approved, role, remark, request_mode, expiry_date, auto_webshare')
+                .select('id, username, hwid, is_approved, role, remark, request_mode, expiry_date, assigned_config, auto_webshare')
                 .order('id');
             if (search) query = query.or(`username.ilike.%${search}%,remark.ilike.%${search}%`);
 
@@ -687,6 +680,23 @@
         window.loadAdminData = loadAdminData;
         if (currentUser && currentUser.role === 'super') refreshSubAdminSelect();
         
+        // 刷新次级管理下拉框
+        async function refreshSubAdminSelect() {
+            const { data } = await sbClient.from('users')
+                .select('id, username')
+                .eq('is_admin', true)
+                .neq('role', 'super');
+            const sel = document.getElementById('subperm-admin-select');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">-- 选择次级管理员 --</option>';
+            (data || []).forEach(u => {
+                const opt = document.createElement('option');
+                opt.value = u.id;
+                opt.textContent = u.username;
+                sel.appendChild(opt);
+            });
+        }
+        window.refreshSubAdminSelect = refreshSubAdminSelect;
         
         // 刷新次级管理下拉框
         async function refreshSubAdminSelect() {
@@ -722,18 +732,10 @@
         }
 
         async function toggleUserStatus(uid, currentStatus, targetRole) {
-    if (!checkPermission(targetRole)) return showCustomAlert("权限不足：无法操作超级管理员！");
-    if (!await showCustomConfirm(`确定要${currentStatus ? '封禁' : '批准'}该用户吗？`)) return;
-    await sbClient.from('users').update({ is_approved: !currentStatus }).eq('id', uid);
-    // 只更新这一行的 DOM，不重新拉全表
-    const row = document.querySelector(`.toggle-status-btn[data-uid="${uid}"]`).closest('tr');
-    const badge = row.querySelector('.status-badge');
-    const btn = row.querySelector('.toggle-status-btn');
-    const newStatus = !currentStatus;
-    badge.className = `status-badge ${newStatus ? 'status-ok' : 'status-ban'}`;
-    badge.textContent = newStatus ? '正常' : '封禁/待审';
-    btn.textContent = newStatus ? '封禁' : '批准';
-    btn.dataset.status = String(newStatus);
+            if (!checkPermission(targetRole)) return showCustomAlert("权限不足：无法操作超级管理员！");
+            if (!await showCustomConfirm(`确定要${currentStatus ? '封禁' : '批准'}该用户吗？`)) return;
+            await sbClient.from('users').update({ is_approved: !currentStatus }).eq('id', uid);
+            loadAdminData();
             // 新用户被批准时，提示超级管理是否授权给次级管理查看
             if (!currentStatus && currentUser.role === 'super') {
                 // 获取用户名
@@ -798,12 +800,13 @@
             }
 
             try {
-                // 直接用 jsonb || 合并写入，无需先 SELECT
-                const { error } = await sbClient.rpc('merge_assigned_config', {
-                    p_uid: uid,
-                    p_mode: mode,
-                    p_data: configData
-                });
+                const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', uid).single();
+                let currentConfig = userData.assigned_config || {};
+                currentConfig[mode] = configData;
+                const { error } = await sbClient.from('users').update({ 
+                    assigned_config: currentConfig,
+                    request_mode: null 
+                }).eq('id', uid);
                 if (error) throw error;
                 showCustomAlert(`✅ 已成功分配给 [${username}]！\n用户点击同步即可生效。`);
                 loadAdminData(); 
@@ -1039,7 +1042,7 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         async function loadPaymentInfo() {
             const editElements = ['pay-qr-input', 'pay-addr-input', 'pay-note-input', 'btn-save-pay', 'pay-edit-tip'];
             editElements.forEach(id => document.getElementById(id).style.display = 'none');
-            const { data, error } = await sbClient.from('app_config').select('pay_wechat_url, pay_usdt_addr, pay_note').eq('id', 1).single();
+            const { data, error } = await sbClient.from('app_config').select('*').eq('id', 1).single();
             if (error) return;
             document.getElementById('pay-qr-input').value = data.pay_wechat_url || '';
             document.getElementById('pay-addr-input').value = data.pay_usdt_addr || '';
@@ -1075,129 +1078,81 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
         }
         function closeImagePreview() { document.getElementById('image-preview-overlay').style.display = 'none'; }
 
-        // ============================================================
-        // 🚀 管理员轮询监听（替代 Realtime 常驻订阅，彻底消除大体积消息）
-        // 原 Realtime 通道每次触发下发完整行数据（2000+ 字节）。
-        // 改为每30秒轻量轮询，仅查询4列，单次请求约100字节。
-        // ============================================================
-        let _adminPollInterval = null;
-        let _lastKnownUserCount = null; // null = 尚未建立基准（首次轮询专用）
-
+        // ================= 🚀 实时监听 =================
         function initAdminRealtimeListener() {
             if (!currentUser || currentUser.role !== 'super') return;
-            if (_adminPollInterval) return; // 防止重复启动
+            console.log("[System] 管理员监听服务已启动...");
+            sbClient.channel('admin-global-alerts').on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'users', filter: 'request_mode=neq.null' }, (payload) => {
+                const newData = payload.new;
+                if (newData.request_mode) {
+                    const uniqueKey = `${newData.id}_${newData.request_mode}`;
+                    if (notifiedCache.has(uniqueKey)) return;
+                    notifiedCache.add(uniqueKey);
 
-            // ✅ 省流优化：只查两个最小字段用于变更检测，不拉完整数据
-            // 策略：只查 id + request_mode，用总行数检测新用户，用 request_mode 检测申请
-            // 间隔从 30s 改为 3 分钟，管理员后台不是实时系统，3分钟响应完全够用
-            // 窗口隐藏时暂停轮询，切回来时恢复，彻底避免后台空跑
-            console.log("[System] 管理员轮询监听已启动 (3分钟间隔，窗口隐藏时自动暂停)");
+                    // 智能通知系统：判断环境
+                    const title = '本德后台通知';
+                    const body = `用户 [${newData.username}] 请求刷新服务器，请及时处理！`;
 
-            async function pollAdminAlerts() {
-                // ✅ 窗口不可见时跳过本次轮询，节省流量
-                if (document.hidden) return;
-                if (!currentUser || !sbClient) return;
-                try {
-                    // ✅ 只查 3 列（去掉 username、auto_webshare），体积从 5KB 降到 < 1KB
-                    const { data, error } = await sbClient
-                        .from('users')
-                        .select('id, request_mode, auto_webshare')
-                        .order('id');
-                    if (error || !data) return;
-
-                    // ── 首次轮询：仅建立基准，不触发任何通知或刷新 ──
-                    if (_lastKnownUserCount === null) {
-                        _lastKnownUserCount = data.length;
-                        data.filter(u => u.request_mode).forEach(u => {
-                            notifiedCache.add(`${u.id}_${u.request_mode}`);
-                        });
-                        console.log(`[AdminPoll] 基准已建立：${data.length} 个用户，${notifiedCache.size} 个进行中请求已忽略`);
-                        return;
-                    }
-
-                    // 1. 检测新注册用户
-                    if (data.length > _lastKnownUserCount) {
-                        // ✅ 有新用户时才单独查 username，避免每次都传输
-                        const newIds = data.slice(_lastKnownUserCount).map(u => u.id);
-                        const { data: newUsers } = await sbClient
-                            .from('users')
-                            .select('id, username')
-                            .in('id', newIds);
-                        (newUsers || []).forEach(u => {
-                            const title = '本德后台通知';
-                            const body = `新用户 [${u.username}] 已注册，请及时审核！`;
-                            if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
-                                window.electronAPI.showSysNotification(title, body);
-                            } else if ('Notification' in window && Notification.permission === 'granted') {
-                                new Notification(title, { body });
-                            }
-                        });
-                        if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
-                    }
-                    _lastKnownUserCount = data.length;
-
-                    // 2. 检测有待处理的服务器刷新请求
-                    const pending = data.filter(u => u.request_mode);
-                    for (const newData of pending) {
-                        const uniqueKey = `${newData.id}_${newData.request_mode}`;
-                        if (notifiedCache.has(uniqueKey)) continue;
-                        notifiedCache.add(uniqueKey);
-
-                        // ✅ 有新请求时才单独查 username
-                        const { data: uInfo } = await sbClient
-                            .from('users').select('username').eq('id', newData.id).single();
-                        const username = uInfo ? uInfo.username : `用户${newData.id}`;
-
-                        const title = '本德后台通知';
-                        const body = `用户 [${username}] 请求刷新服务器，请及时处理！`;
-                        if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
-                            window.electronAPI.showSysNotification(title, body);
-                        } else if ('Notification' in window) {
-                            if (Notification.permission === 'granted') {
-                                new Notification(title, { body });
-                            } else if (Notification.permission !== 'denied') {
-                                Notification.requestPermission().then(p => {
-                                    if (p === 'granted') new Notification(title, { body });
-                                });
-                            }
-                        }
-
-                        // 3. 自动分配 Webshare（auto_webshare 开启时）
-                        if (newData.request_mode === 'webshare' && newData.auto_webshare) {
-                            (async () => { try {
-                                const { data: cfgData } = await sbClient.from('app_config').select('webshare_global_url').eq('id', 1).single();
-                                const globalUrl = cfgData && cfgData.webshare_global_url;
-                                if (globalUrl) {
-                                    const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', newData.id).single();
-                                    let currentConfig = (userData && userData.assigned_config) || {};
-                                    currentConfig['webshare'] = { url: globalUrl, updated_at: new Date().toISOString() };
-                                    await sbClient.from('users').update({
-                                        assigned_config: currentConfig,
-                                        request_mode: null
-                                    }).eq('id', newData.id);
-                                    console.log(`[Auto] 已自动分配服务器三给用户 [${username}]`);
+                    // 1. 如果在 Electron 软件环境中
+                    if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
+                        window.electronAPI.showSysNotification(title, body);
+                    } 
+                    // 2. 如果在普通浏览器环境中
+                    else if ('Notification' in window) {
+                        if (Notification.permission === 'granted') {
+                            new Notification(title, { body: body });
+                        } else if (Notification.permission !== 'denied') {
+                            Notification.requestPermission().then(permission => {
+                                if (permission === 'granted') {
+                                    new Notification(title, { body: body });
                                 }
-                            } catch(e) {
-                                console.error('[Auto] 自动分配失败:', e);
-                            } })();
+                            });
                         }
-
-                        if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
                     }
-                } catch(e) {
-                    console.error("[AdminPoll] 轮询失败:", e);
+                    // 自动分配服务器三
+                    if (newData.request_mode === 'webshare' && newData.auto_webshare) {
+                        (async () => { try {
+                            const { data: cfgData } = await sbClient.from('app_config').select('webshare_global_url').eq('id', 1).single();
+                            const globalUrl = cfgData && cfgData.webshare_global_url;
+                            if (globalUrl) {
+                                const { data: userData } = await sbClient.from('users').select('assigned_config').eq('id', newData.id).single();
+                                let currentConfig = userData.assigned_config || {};
+                                currentConfig['webshare'] = { url: globalUrl, updated_at: new Date().toISOString() };
+                                await sbClient.from('users').update({
+                                    assigned_config: currentConfig,
+                                    request_mode: null
+                                }).eq('id', newData.id);
+                                console.log(`[Auto] 已自动分配服务器三给用户 [${newData.username}]`);
+                            }
+                        } catch(e) {
+                            console.error('[Auto] 自动分配失败:', e);
+                        } })();
+                    }
+
+                    if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
                 }
-            }
+            }).subscribe((status) => console.log("📡 管理员通道订阅状态:", status));
 
-            pollAdminAlerts(); // 登录后立即执行一次（建立基准）
-            _adminPollInterval = setInterval(pollAdminAlerts, 180000); // ✅ 3分钟轮询一次（原30秒）
+            sbClient.channel('admin-new-user-alerts').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'users' }, (payload) => {
+                const newData = payload.new;
+                const title = '本德后台通知';
+                const body = `新用户 [${newData.username}] 已注册，请及时审核！`;
+                if (window.electronAPI && typeof window.electronAPI.showSysNotification === 'function') {
+                    window.electronAPI.showSysNotification(title, body);
+                } else if ('Notification' in window) {
+                    if (Notification.permission === 'granted') {
+                        new Notification(title, { body: body });
+                    } else if (Notification.permission !== 'denied') {
+                        Notification.requestPermission().then(permission => {
+                            if (permission === 'granted') new Notification(title, { body: body });
+                        });
+                    }
+                }
 
-            // ✅ 窗口切回前台时立即补一次轮询，保证及时性
-            document.addEventListener('visibilitychange', () => {
-                if (!document.hidden && currentUser) pollAdminAlerts();
-            });
+                
+                if (document.getElementById('page-admin').classList.contains('active')) loadAdminData();
+            }).subscribe((status) => console.log("📡 新用户通道订阅状态:", status));
         }
-
         // ============================================================
         // 💰 续费功能核心逻辑
         // ============================================================
@@ -1343,7 +1298,6 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
             const uid = renewState.userId;
 
             // 计算新到期时间（以美国西部时间 America/Los_Angeles 为基准）
-            // 先取当前用户最新到期时间，若未到期则从到期日续，若已到期则从现在续
             const { data: uData } = await sbClient.from('users').select('expiry_date').eq('id', uid).single();
 
             // 获取美国西部当前时间
@@ -1351,7 +1305,6 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
             let baseDate;
             if (uData && uData.expiry_date) {
                 const existingExpiry = new Date(uData.expiry_date);
-                // 若当前到期日在未来，则从到期日开始叠加；否则从现在开始
                 baseDate = existingExpiry > nowPST ? existingExpiry : nowPST;
             } else {
                 baseDate = nowPST;
@@ -1359,7 +1312,6 @@ const { error } = await sbClient.from('app_config').update({ version: ver, downl
 
             // 每月精确加 30 天
             const newExpiry = new Date(baseDate.getTime() + months * 30 * 24 * 60 * 60 * 1000);
-            // 格式化为标准 ISO 字符串存入数据库
             const newExpiryISO = newExpiry.toISOString();
 
             // 更新用户到期时间
